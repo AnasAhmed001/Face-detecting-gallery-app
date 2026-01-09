@@ -1,0 +1,55 @@
+name: Deploy SMIT Moments on Cpanel
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'frontend/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.x]   # required by react-router-dom 7
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Fix Rollup missing binary
+        run: npm install @rollup/rollup-linux-x64-gnu --save-dev --force
+
+      - name: Fix LightningCSS missing binary
+        run: npm install lightningcss --save-dev --force
+
+      - name: Fix Tailwind Oxide missing binary
+        run: npm install @tailwindcss/oxide-linux-x64-gnu --save-dev --force
+
+      - name: Build project
+        run: npm run build
+        env:
+          CI: ""
+          GENERATE_SOURCEMAP: false
+
+      - name: FTP Deploy
+        uses: SamKirkland/FTP-Deploy-Action@4.3.3
+        with:
+          log-level: verbose
+          security: strict
+          local-dir: frontend/dist/
+          server: ftp.saylanimit.com
+          username: moments@saylanimit.com
+          password: ${{ secrets.ftp_password }}

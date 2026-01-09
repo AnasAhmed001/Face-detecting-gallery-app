@@ -1,0 +1,9 @@
+node_modules
+serviceAccountKey.json
+.env
+.env.local
+.env.example
+.env.test
+.env.production
+.env.development
+
