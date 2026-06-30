@@ -1,4 +1,5 @@
 import { User } from "../models/User.js";
+import bcrypt from "bcrypt";
 
 export const addPhotographer = async (req, res) => {
   try {
@@ -8,11 +9,14 @@ export const addPhotographer = async (req, res) => {
     if (exists)
       return res.status(400).json({ message: "Email already exists" });
 
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
     const photographer = await User.create({
       name,
       email,
       phone,
-      password,
+      password: hashedPassword,
       role: "photographer",
     });
 
@@ -72,7 +76,10 @@ export const editPhotographer = async (req, res) => {
     if (name) user.name = name;
     if (email) user.email = email;
     if (phone) user.phone = phone;
-    if (password) user.password = password;
+    if (password) {
+      const salt = await bcrypt.genSalt(10);
+      user.password = await bcrypt.hash(password, salt);
+    }
 
 
     const updatedPhotographer = await user.save();

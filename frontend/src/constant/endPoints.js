@@ -1,6 +1,5 @@
 let END_POINTS = {
-  API_BASE_URL: "https://api-moments.saylanimit.com/api/",
-  // API_BASE_URL: "http://localhost:5000/api/",
+  API_BASE_URL: "http://localhost:5000/api/",
   //EVENTS
   GET_EVENTS_BY_USER_ID: "/events/user",
   CREATE_EVENT: "/events/create",

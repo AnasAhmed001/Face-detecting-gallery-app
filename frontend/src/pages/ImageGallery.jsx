@@ -170,13 +170,12 @@ export default function ImageGallery() {
       const formData = new FormData();
       formData.append("selfie", file);
 
-      // 🔥 Call face match API
-      const faceMatchResponse = await fetch(`https://api-moments.saylanimit.com/api/faceMatch/${eventId}`, {
-        method: "POST",
-        body: formData,
-      }).then((res) => res.json());
+      // 🔥 Call face match API using axios
+      const faceMatchResponse = await api.post(`faceMatch/${eventId}`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
 
-      setMatchedImages(faceMatchResponse.images || []);
+      setMatchedImages(faceMatchResponse.data.images || []);
     } catch (error) {
       console.error("Reload error:", error);
       alert("Failed to reload matches. Try again.");

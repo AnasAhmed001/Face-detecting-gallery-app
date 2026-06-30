@@ -1,8 +1,11 @@
 import mongoose from 'mongoose';
 
-const db = mongoose.connection.db;
-
 export async function setupIndexes() {
+  const db = mongoose.connection.db;
+  if (!db) {
+    console.error('MongoDB connection not ready when setupIndexes was called');
+    return;
+  }
   // face_metadata collection (stores non-vector face data)
   await db.collection('face_metadata').createIndex({ faceId: 1 }, { unique: true });
   await db.collection('face_metadata').createIndex({ eventId: 1, createdAt: -1 });

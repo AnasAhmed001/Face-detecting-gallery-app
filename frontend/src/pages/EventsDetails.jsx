@@ -506,8 +506,21 @@ export default function EventsDetails() {
               });
             }
           );
+
+          // Trigger face extraction on the backend after the raw image is uploaded to R2
+          const imageKey = `saylani-moments/${userId}/${eventId}/rawuploads/${s.sanitizedName}`;
+          const processResp = await api.post("s3/process-image", {
+            userId,
+            eventId,
+            imageKey,
+          });
+
+          if (processResp.data && processResp.data.success && processResp.data.image) {
+            return processResp.data.image;
+          }
+
           return {
-            id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+            id: s.sanitizedName.split(".")[0],
             name: s.sanitizedName,
             rawUrl: finalUrl,
             thumbUrl: finalUrl,

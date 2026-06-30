@@ -7,9 +7,13 @@ import os
 from io import BytesIO
 from datetime import datetime
 import hashlib
-import numpy as np
-from PIL import Image
-import cv2
+# These packages are installed inside the Modal container but might not be installed locally
+try:
+    import numpy as np
+    from PIL import Image
+    import cv2
+except ImportError:
+    pass
 
 # Create Modal app
 app = modal.App("face-processing-service")
@@ -17,16 +21,19 @@ app = modal.App("face-processing-service")
 # Define the image with dependencies
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("libgl1-mesa-glx", "libglib2.0-0")
+    .apt_install("libgl1-mesa-glx", "libglib2.0-0", "build-essential", "cmake")
+    .pip_install("setuptools", "wheel", "numpy==1.26.4", "Cython")
+    .run_commands("pip install --no-build-isolation insightface==0.7.3")
     .pip_install(
-        "insightface==0.7.3",
-        "onnxruntime==1.16.3",
+        "onnxruntime==1.17.0",
         "opencv-python==4.8.1.78",
         "pillow==10.1.0",
-        "numpy==1.24.3",
         "pymongo==4.6.0",
         "minio==7.2.0",
         "qdrant-client==1.7.0",
+        "numpy==1.26.4",
+        "scipy==1.12.0",
+        "fastapi[standard]",
     )
     .run_commands(
         "python -c 'from insightface.app import FaceAnalysis; "
@@ -35,16 +42,8 @@ image = (
     )
 )
 
-# Environment secrets
-secrets = modal.Secret.from_dict({
-    "MONGO_URI": os.getenv("MONGO_URI", ""),
-    "R2_ACCOUNT_ID": os.getenv("R2_ACCOUNT_ID", ""),
-    "R2_ACCESS_KEY_ID": os.getenv("R2_ACCESS_KEY_ID", ""),
-    "R2_SECRET_ACCESS_KEY": os.getenv("R2_SECRET_ACCESS_KEY", ""),
-    "R2_BUCKET": os.getenv("R2_BUCKET", ""),
-    "QDRANT_URL": os.getenv("QDRANT_URL", ""),
-    "QDRANT_API_KEY": os.getenv("QDRANT_API_KEY", ""),
-})
+# Environment secrets (stored in Modal's secret store)
+secrets = modal.Secret.from_name("face-processing-secrets")
 
 
 def generate_face_id(image_key, face_index):
@@ -82,7 +81,7 @@ def create_derivatives(image_bytes):
     timeout=600,
     memory=2048,
 )
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")
 def detect_faces(data: dict):
     """Detect faces in an image, create derivatives, and store metadata"""
     from insightface.app import FaceAnalysis
@@ -228,7 +227,7 @@ def detect_faces(data: dict):
     timeout=60,
     memory=2048,
 )
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")
 def match_face(data: dict):
     """Match a selfie against faces in an event"""
     import base64

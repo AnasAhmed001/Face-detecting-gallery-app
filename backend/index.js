@@ -14,6 +14,7 @@ import faceMatchRoutes from "./routes/faceMatchRoutes.js";
 import userDashboardRoutes from "./routes/userDashboardRoutes.js";
 import saveMatchedRoutes from "./routes/saveMatchedRoutes.js";
 import morgan from "morgan";
+import cookieParser from "cookie-parser";
 
 dotenv.config();
 
@@ -31,7 +32,24 @@ app.use(compression({
   threshold: 1024,  // Only compress responses > 1KB
 }));
 
-app.use(cors());
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:3000",
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true,
+}));
+
+app.use(cookieParser());
 app.use(morgan("dev"));
 
 app.use(express.json({ limit: "100mb" }));

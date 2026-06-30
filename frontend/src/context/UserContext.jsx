@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState } from "react";
+import api from "../api/axios";
 
 export const UserContext = createContext();
 
@@ -36,18 +37,19 @@ export const UserProvider = ({ children }) => {
         const id = newUser?.id || newUser?._id || newUser?.uid || null;
         setUserId(id);
       }
-      if (token) {
-        localStorage.setItem("token", token);
-      }
     } catch (e) {
       console.error("Failed to set auth in localStorage", e);
     }
   };
 
-  const logout = () => {
+  const logout = async () => {
+    try {
+      await api.post("/auth/logout");
+    } catch (e) {
+      console.error("Failed to log out on backend", e);
+    }
     try {
       localStorage.removeItem("role");
-      localStorage.removeItem("token");
       localStorage.removeItem("user");
     } catch {}
     setRole(null);

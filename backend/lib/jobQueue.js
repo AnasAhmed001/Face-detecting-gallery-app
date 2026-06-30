@@ -1,7 +1,8 @@
 import axios from 'axios';
 import crypto from 'crypto';
 
-const MODAL_FUNCTION_URL = process.env.MODAL_FUNCTION_URL;
+const MODAL_DETECT_FACES_URL = process.env.MODAL_DETECT_FACES_URL || `${process.env.MODAL_FUNCTION_URL}/detect-faces`;
+const MODAL_MATCH_FACE_URL = process.env.MODAL_MATCH_FACE_URL || `${process.env.MODAL_FUNCTION_URL}/match-face`;
 const MODAL_WEBHOOK_SECRET = process.env.MODAL_WEBHOOK_SECRET;
 
 /**
@@ -9,7 +10,7 @@ const MODAL_WEBHOOK_SECRET = process.env.MODAL_WEBHOOK_SECRET;
  */
 export async function enqueueFaceDetection({ userId, eventId, imageKey }) {
   try {
-    const response = await axios.post(`${MODAL_FUNCTION_URL}/detect-faces`, {
+    const response = await axios.post(MODAL_DETECT_FACES_URL, {
       userId,
       eventId,
       imageKey,
@@ -37,7 +38,7 @@ export async function enqueueFaceMatching({ eventId, selfieBuffer, threshold = 0
     // Convert buffer to base64 for transmission
     const selfieBase64 = selfieBuffer.toString('base64');
 
-    const response = await axios.post(`${MODAL_FUNCTION_URL}/match-face`, {
+    const response = await axios.post(MODAL_MATCH_FACE_URL, {
       eventId,
       selfieBase64,
       threshold,

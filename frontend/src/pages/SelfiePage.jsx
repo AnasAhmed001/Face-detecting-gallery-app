@@ -158,8 +158,8 @@ export default function SelfiePage() {
         throw new Error("No face match found. Please try again with a clearer photo.");
       }
 
-      // ✅ Use "id" from API
-      const matchedFaceId = matchedImages[0]?.id;
+      // ✅ Use matchedFaceId from API
+      const matchedFaceId = matchedImages[0]?.matchedFaceId || matchedImages[0]?.id;
 
       if (!matchedFaceId) {
         toast.error("No face match ID found in response. Please contact support.");

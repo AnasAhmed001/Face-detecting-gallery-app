@@ -1,8 +1,20 @@
 import Redis from 'ioredis';
 import crypto from 'crypto';
 
+// Handle cases where the HTTPS REST URL is provided instead of the Redis TCP URL
+const getRedisConnectionUrl = () => {
+  const url = process.env.UPSTASH_REDIS_URL;
+  if (!url) return '';
+  if (url.startsWith('https://')) {
+    const host = url.replace('https://', '');
+    const token = process.env.UPSTASH_REDIS_TOKEN;
+    return `rediss://default:${token}@${host}:6379`;
+  }
+  return url;
+};
+
 // Initialize Upstash Redis client
-const redis = new Redis(process.env.UPSTASH_REDIS_URL, {
+const redis = new Redis(getRedisConnectionUrl(), {
   tls: {
     rejectUnauthorized: true
   },
