@@ -1,7 +1,4 @@
-import { ListObjectsV2Command } from "@aws-sdk/client-s3";
-import { s3 } from "../lib/awsClients.js";
-
-const Bucket = process.env.S3_BUCKET;
+import { listObjects } from "../lib/storageService.js";
 
 export const getTotalUserPhotos = async (req, res) => {
   try {
@@ -10,35 +7,12 @@ export const getTotalUserPhotos = async (req, res) => {
     if (!userId) return res.status(400).json({ message: "UserId is required" });
 
     const basePrefix = `saylani-moments/${userId}/`;
-    const listAllObjects = async (prefix) => {
-      let isTruncated = true;
-      let continuationToken = undefined;
-      let keys = [];
 
-      while (isTruncated) {
-        const command = new ListObjectsV2Command({
-          Bucket,
-          Prefix: prefix,
-          ContinuationToken: continuationToken,
-        });
+    const allObjects = await listObjects(basePrefix);
 
-        const response = await s3.send(command);
-        const objects = response.Contents || [];
-
-        keys.push(...objects.map((obj) => obj.Key));
-
-        isTruncated = response.IsTruncated;
-        continuationToken = response.NextContinuationToken;
-      }
-
-      return keys;
-    };
-
-    const allKeys = await listAllObjects(basePrefix);
-
-    const mdImages = allKeys.filter((key) =>
-      key.includes("/derivative/md/") &&
-      (key.endsWith(".webp") || key.endsWith(".jpg") || key.endsWith(".jpeg") || key.endsWith(".png"))
+    const mdImages = allObjects.filter((obj) =>
+      obj.name.includes("/derivative/md/") &&
+      (obj.name.endsWith(".webp") || obj.name.endsWith(".jpg") || obj.name.endsWith(".jpeg") || obj.name.endsWith(".png"))
     );
 
     return res.json({ totalPhotos: mdImages.length });
@@ -47,3 +21,4 @@ export const getTotalUserPhotos = async (req, res) => {
     return res.status(500).json({ message: "Internal Server Error" });
   }
 };
+

@@ -11,7 +11,6 @@ export const saveMatchedFaceData = async (req, res) => {
     // Check if email already exists
     const existingGuest = await Guest.findOne({ email });
     if (existingGuest) {
-      // Agar email already hai toh save mat karo, bas 200 success return karo
       return res.status(200).json({ message: "User already exists, skipping save" });
     }
 
@@ -26,7 +25,6 @@ export const saveMatchedFaceData = async (req, res) => {
       designation,
     });
 
-    // Save the guest in the database
     await newGuest.save();
 
     return res.status(200).json({ message: "User data saved successfully" });

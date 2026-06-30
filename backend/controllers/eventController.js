@@ -1,11 +1,10 @@
 import Event from "../models/Event.js";
-import { s3, docClient } from "../lib/awsClients.js";
-import { ListObjectsV2Command, DeleteObjectsCommand } from "@aws-sdk/client-s3";
-import { QueryCommand, BatchWriteCommand ,GetCommand } from "@aws-sdk/lib-dynamodb";
+import { listObjects, deleteObjects, generatePublicUrl } from "../lib/storageService.js";
+import { deleteFacesByEvent } from "../lib/qdrantService.js";
+import { cache } from "../lib/cacheService.js";
+import mongoose from 'mongoose';
 
-const Bucket = process.env.S3_BUCKET;
-const TABLE_NAME = process.env.DYNAMO_TABLE;
-const TABLE_INDEX_NAME = process.env.DYNAMO_TABLE_INDEX;
+const Bucket = process.env.MINIO_BUCKET;
 
 export const createEvent = async (req, res) => {
   try {
@@ -60,7 +59,7 @@ export const getEventsByUser = async (req, res) => {
 // GET /events/:eventId/faces
 export const getEventFaces = async (req, res) => {
   const { eventId } = req.params;
-  console.log(eventId)
+  console.log(eventId);
 
   if (!eventId) {
     return res
@@ -69,17 +68,25 @@ export const getEventFaces = async (req, res) => {
   }
 
   try {
-    const command = new QueryCommand({
-      TableName: process.env.EVENT_FACES_TABLE || 'EventFaces', // e.g. "EventFaces"
-      KeyConditionExpression: "EventId = :e",
-      ExpressionAttributeValues: {
-        ":e": eventId,
-      },
-    });
+    const db = mongoose.connection.db;
 
-    const result = await docClient.send(command);
+    // Aggregate to get unique faces per event with image counts
+    const faces = await db.collection('face_metadata').aggregate([
+      { $match: { eventId } },
+      {
+        $group: {
+          _id: "$faceId",
+          faceId: { $first: "$faceId" },
+          eventId: { $first: "$eventId" },
+          imageKey: { $first: "$imageKey" },
+          firstSeenAt: { $min: "$createdAt" },
+          lastSeenAt: { $max: "$createdAt" },
+          imageCount: { $sum: 1 }
+        }
+      }
+    ]).toArray();
 
-    if (!result.Items || result.Items.length === 0) {
+    if (!faces || faces.length === 0) {
       return res
         .status(404)
         .json({ success: false, message: "No faces found for this event" });
@@ -87,16 +94,14 @@ export const getEventFaces = async (req, res) => {
 
     res.json({
       success: true,
-      count: result.Count,
-      faces: result.Items.map((f) => ({
-        faceId: f.FaceId,
-        eventId: f.EventId,
-        thumbUrl: f.FaceThumbKey, // S3 key or full URL (depends how you store)
-        imageCount: f.ImageCount ?? 0,
-        guestId: f.GuestId ?? null,
-        displayName: f.DisplayName ?? null,
-        firstSeenAt: f.FirstSeenAt ?? null,
-        lastSeenAt: f.LastSeenAt ?? null,
+      count: faces.length,
+      faces: faces.map((f) => ({
+        faceId: f.faceId,
+        eventId: f.eventId,
+        thumbUrl: generatePublicUrl(f.imageKey), // Using the first image as thumb
+        imageCount: f.imageCount,
+        firstSeenAt: f.firstSeenAt,
+        lastSeenAt: f.lastSeenAt,
       })),
     });
   } catch (error) {
@@ -107,22 +112,11 @@ export const getEventFaces = async (req, res) => {
   }
 };
 
-/** Builds a public S3 URL for a key using the bucket name */
-function toPublicUrl(key) {
-  const BUCKET = process.env.S3_BUCKET; // e.g. "saylanimoment"
-  if (!key || !BUCKET) return null;
-  // Encode safely but keep slashes
-  const safeKey = encodeURIComponent(key).replace(/%2F/g, "/");
-  return `https://${BUCKET}.s3.amazonaws.com/${safeKey}`;
-}
-
 export const getEventFaceImages = async (req, res) => {
-  const FACE_IMAGES_TABLE = process.env.FACE_IMAGES_TABLE || "FaceImages";
-  const EVENT_FACES_TABLE = process.env.EVENT_FACES_TABLE || "EventFaces";
-
   const { eventId, faceId } = req.params;
   const limit = Math.min(parseInt(req.query.limit || "30", 10), 100);
-  const cursor = req.query.cursor ? String(req.query.cursor) : null;
+  const page = parseInt(req.query.page || "1", 10);
+  const skip = (page - 1) * limit;
 
   if (!eventId || !faceId) {
     return res
@@ -130,66 +124,55 @@ export const getEventFaceImages = async (req, res) => {
       .json({ success: false, message: "eventId and faceId are required" });
   }
 
-  const eventFaceId = `${eventId}#${faceId}`;
-
-  let ExclusiveStartKey;
-  if (cursor) {
-    try {
-      ExclusiveStartKey = JSON.parse(Buffer.from(cursor, "base64").toString("utf8"));
-    } catch {
-      return res.status(400).json({ success: false, message: "Invalid cursor" });
-    }
-  }
-
   try {
-    // 1) Get face thumbnail from EventFaces
-    const faceMeta = await docClient.send(
-      new GetCommand({
-        TableName: EVENT_FACES_TABLE,
-        Key: { EventId: eventId, FaceId: faceId },
-        ProjectionExpression: "FaceThumbKey",
-      })
-    );
-    const faceThumbUrl = faceMeta?.Item?.FaceThumbKey
-      ? toPublicUrl(faceMeta.Item.FaceThumbKey)
+    const db = mongoose.connection.db;
+
+    // Get face thumbnail from face_metadata
+    const faceMeta = await db.collection('face_metadata').findOne({
+      faceId,
+      eventId
+    });
+
+    const faceThumbUrl = faceMeta?.imageKey
+      ? generatePublicUrl(faceMeta.imageKey)
       : null;
 
-    // 2) Query images for this face
-    const out = await docClient.send(
-      new QueryCommand({
-        TableName: FACE_IMAGES_TABLE,
-        KeyConditionExpression: "EventFaceId = :k",
-        ExpressionAttributeValues: { ":k": eventFaceId },
-        ScanIndexForward: false, // newest first
-        Limit: limit,
-        ExclusiveStartKey,
-        ProjectionExpression:
-          "ImageSort, OriginalKey, MdKey, ThumbKey, CapturedAt",
-      })
-    );
+    // Query images for this face with pagination
+    const faceImages = await db.collection('face_images').find({
+      eventId,
+      faceId
+    })
+    .sort({ processedAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .toArray();
 
-    // 3) Map to URL-only payload (no keys returned)
-    const images = (out.Items || []).map((it) => ({
-      imageSort: it.ImageSort,
-      capturedAt: it.CapturedAt || null,
-      originalUrl: toPublicUrl(it.OriginalKey),
-      mdUrl: toPublicUrl(it.MdKey),
-      thumbUrl: toPublicUrl(it.ThumbKey),
+    // Get total count for pagination
+    const totalCount = await db.collection('face_images').countDocuments({
+      eventId,
+      faceId
+    });
+
+    // Map to URL-only payload
+    const images = faceImages.map((it) => ({
+      imageId: it._id.toString(),
+      capturedAt: it.processedAt || null,
+      originalUrl: generatePublicUrl(it.originalKey),
+      mdUrl: generatePublicUrl(it.mdKey),
+      thumbUrl: generatePublicUrl(it.thumbKey),
     }));
-
-    const nextCursor = out.LastEvaluatedKey
-      ? Buffer.from(JSON.stringify(out.LastEvaluatedKey), "utf8").toString("base64")
-      : null;
 
     return res.json({
       success: true,
       count: images.length,
-      faceThumbUrl, // <- requested addition
+      total: totalCount,
+      page,
+      totalPages: Math.ceil(totalCount / limit),
+      faceThumbUrl,
       images,
-      nextCursor,
     });
   } catch (err) {
-    console.error("Error querying FaceImages:", err);
+    console.error("Error querying face images:", err);
     return res
       .status(500)
       .json({ success: false, message: "Error fetching images" });
@@ -273,41 +256,34 @@ export const deleteEvent = async (req, res) => {
 
     console.log(`✅ Path validation passed`);
 
-    const listParams = {
-      Bucket,
-      Prefix: s3EventPath,
-      MaxKeys: 1000,
-    };
-
+    // List objects from MinIO
     console.log(`📋 Listing objects with prefix: "${s3EventPath}"`);
-    const listResponse = await s3.send(new ListObjectsV2Command(listParams));
+    const listResponse = await listObjects(s3EventPath, 1000);
 
-    if (!listResponse.Contents || listResponse.Contents.length === 0) {
-      console.log(`📭 No S3 objects found for deletion`);
+    if (!listResponse || listResponse.length === 0) {
+      console.log(`📭 No MinIO objects found for deletion`);
     } else {
-      console.log(
-        `📁 Found ${listResponse.Contents.length} objects to analyze:`
-      );
+      console.log(`📁 Found ${listResponse.length} objects to analyze:`);
 
       const safeObjects = [];
       const unsafeObjects = [];
 
-      listResponse.Contents.forEach((obj, index) => {
-        console.log(`   ${index + 1}. Checking: "${obj.Key}"`);
+      listResponse.forEach((obj, index) => {
+        console.log(`   ${index + 1}. Checking: "${obj.name}"`);
 
-        if (!obj.Key.startsWith(s3EventPath)) {
+        if (!obj.name.startsWith(s3EventPath)) {
           console.log(`   ❌ UNSAFE: Doesn't start with expected path`);
           unsafeObjects.push(obj);
           return;
         }
 
-        if (obj.Key.length <= s3EventPath.length) {
+        if (obj.name.length <= s3EventPath.length) {
           console.log(`   ❌ UNSAFE: Too short (might be parent folder)`);
           unsafeObjects.push(obj);
           return;
         }
 
-        const pathParts = obj.Key.split("/");
+        const pathParts = obj.name.split("/");
         const eventIdIndex = pathParts.indexOf(eventId);
         const userIdIndex = pathParts.indexOf(userId);
 
@@ -332,7 +308,7 @@ export const deleteEvent = async (req, res) => {
           `🚨 DANGER DETECTED: ${unsafeObjects.length} unsafe objects found!`
         );
         unsafeObjects.forEach((obj) => {
-          console.log(`   💥 UNSAFE: ${obj.Key}`);
+          console.log(`   💥 UNSAFE: ${obj.name}`);
         });
 
         return res.status(400).json({
@@ -342,10 +318,10 @@ export const deleteEvent = async (req, res) => {
             eventId,
             userId,
             expectedPath: s3EventPath,
-            totalObjects: listResponse.Contents.length,
+            totalObjects: listResponse.length,
             safeObjects: safeObjects.length,
             unsafeObjects: unsafeObjects.length,
-            unsafeKeys: unsafeObjects.map((o) => o.Key),
+            unsafeKeys: unsafeObjects.map((o) => o.name),
           },
         });
       }
@@ -355,69 +331,44 @@ export const deleteEvent = async (req, res) => {
           `🔒 Proceeding with SAFE deletion of ${safeObjects.length} objects`
         );
 
-        const deleteParams = {
-          Bucket,
-          Delete: {
-            Objects: safeObjects.map((obj) => ({ Key: obj.Key })),
-            Quiet: false,
-          },
-        };
+        await deleteObjects(safeObjects.map((obj) => obj.name));
 
-        const deleteResponse = await s3.send(
-          new DeleteObjectsCommand(deleteParams)
-        );
-
-        console.log(`✅ S3 Deletion completed:`);
-        console.log(
-          `   Successfully deleted: ${deleteResponse.Deleted?.length || 0}`
-        );
-        console.log(`   Errors: ${deleteResponse.Errors?.length || 0}`);
-
-        if (deleteResponse.Deleted) {
-          deleteResponse.Deleted.forEach((deleted) => {
-            console.log(`   🗑️  Deleted: ${deleted.Key}`);
-          });
-        }
+        console.log(`✅ MinIO Deletion completed:`);
+        console.log(`   Successfully deleted: ${safeObjects.length}`);
       } else {
         console.log(`📭 No safe objects to delete`);
       }
     }
 
-    const gsi1pk = `EVENT#${eventId}`;
+    // Delete from MongoDB
+    const db = mongoose.connection.db;
     let deletedFaceRecords = 0;
 
     try {
-      const queryParams = {
-        TableName: TABLE_NAME,
-        IndexName: TABLE_INDEX_NAME,
-        KeyConditionExpression: "GSI1PK = :gsi1pk",
-        ExpressionAttributeValues: { ":gsi1pk": gsi1pk },
-      };
+      const faceRecords = await db.collection('face_metadata').find({ eventId }).toArray();
 
-      const queryResult = await docClient.send(new QueryCommand(queryParams));
-
-      if (queryResult.Items && queryResult.Items.length > 0) {
-        const batchSize = 25;
-        for (let i = 0; i < queryResult.Items.length; i += batchSize) {
-          const batch = queryResult.Items.slice(i, i + batchSize);
-          const validRecords = batch.filter((record) => record.FaceId);
-
-          if (validRecords.length > 0) {
-            const batchDeleteParams = {
-              RequestItems: {
-                [TABLE_NAME]: validRecords.map((record) => ({
-                  DeleteRequest: { Key: { FaceId: record.FaceId } },
-                })),
-              },
-            };
-
-            await docClient.send(new BatchWriteCommand(batchDeleteParams));
-            deletedFaceRecords += validRecords.length;
-          }
-        }
+      if (faceRecords.length > 0) {
+        await db.collection('face_metadata').deleteMany({ eventId });
+        deletedFaceRecords = faceRecords.length;
       }
-    } catch (dynamoError) {
-      console.error("DynamoDB deletion error:", dynamoError);
+    } catch (mongoError) {
+      console.error("MongoDB deletion error:", mongoError);
+    }
+
+    // Delete from Qdrant
+    try {
+      await deleteFacesByEvent(eventId);
+      console.log(`✅ Deleted face vectors from Qdrant`);
+    } catch (qdrantError) {
+      console.error("Qdrant deletion error:", qdrantError);
+    }
+
+    // Invalidate cache
+    try {
+      const deletedCacheKeys = await cache.invalidateEvent(eventId);
+      console.log(`✅ Invalidated ${deletedCacheKeys} cache keys`);
+    } catch (cacheError) {
+      console.error("Cache invalidation error:", cacheError);
     }
 
     await Event.deleteOne({ _id: eventId });
@@ -432,10 +383,10 @@ export const deleteEvent = async (req, res) => {
         userId,
         s3Path: s3EventPath,
         deletedS3Objects:
-          listResponse.Contents?.filter(
+          listResponse?.filter(
             (obj) =>
-              obj.Key.startsWith(s3EventPath) &&
-              obj.Key.length > s3EventPath.length
+              obj.name.startsWith(s3EventPath) &&
+              obj.name.length > s3EventPath.length
           ).length || 0,
         deletedFaceRecords,
         pathValidation: {
@@ -457,21 +408,3 @@ export const deleteEvent = async (req, res) => {
     });
   }
 };
-
-// export const deleteEvent = async (req, res) => {
-//   try {
-//     const event = await Event.findById(req.params.eventId);
-
-//     if (!event) {
-//       return res
-//         .status(404)
-//         .json({ success: false, message: "Event not found" });
-//     }
-
-//     await Event.deleteOne({ _id: req.params.eventId });
-
-//     res.json({ success: true, message: "Event deleted successfully" });
-//   } catch (error) {
-//     res.status(500).json({ success: false, message: error.message });
-//   }
-// };

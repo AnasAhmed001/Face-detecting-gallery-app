@@ -1,11 +1,7 @@
-import { s3, rekognition, docClient } from "../lib/awsClients.js";
-import { ListObjectsV2Command } from "@aws-sdk/client-s3";
-import { SearchFacesByImageCommand } from "@aws-sdk/client-rekognition";
-import { QueryCommand } from "@aws-sdk/lib-dynamodb";
-import { getBaseName, generateImageUrls } from "../utils/imageUtils.js";
-
-const Bucket = process.env.S3_BUCKET;
-const TableName = process.env.DYNAMO_TABLE;
+import { enqueueFaceMatching } from "../lib/jobQueue.js";
+import { generatePublicUrl } from "../lib/storageService.js";
+import { cache } from "../lib/cacheService.js";
+import mongoose from 'mongoose';
 
 export const faceMatchImages = async (req, res) => {
   try {
@@ -16,16 +12,23 @@ export const faceMatchImages = async (req, res) => {
       return res.status(400).json({ error: "No selfie uploaded" });
     }
 
-    const searchResponse = await rekognition.send(
-      new SearchFacesByImageCommand({
-        CollectionId: eventId,
-        Image: { Bytes: uploadedFile.buffer },
-        MaxFaces: 100,
-        FaceMatchThreshold: 75,
-      })
-    );
+    // Check cache first
+    const cached = await cache.getCachedFaceMatch(eventId, uploadedFile.buffer);
+    if (cached) {
+      console.log('Cache HIT - returning cached face match results');
+      return res.status(200).json(cached);
+    }
 
-    if (!searchResponse.FaceMatches?.length) {
+    console.log('Cache MISS - performing face matching');
+
+    // Enqueue and wait for face matching
+    const result = await enqueueFaceMatching({
+      eventId,
+      selfieBuffer: uploadedFile.buffer,
+      threshold: 0.75,
+    });
+
+    if (!result || !result.matches || result.matches.length === 0) {
       return res.status(200).json({
         message: "No matching faces found",
         images: [],
@@ -33,118 +36,44 @@ export const faceMatchImages = async (req, res) => {
       });
     }
 
-    const matchingFaceIds = searchResponse.FaceMatches.map(
-      (match) => match.Face.FaceId
-    );
+    const matches = result.matches;
+    const db = mongoose.connection.db;
 
-    const imageKeys = [];
-    const faceIdToImageKeyMap = new Map(); // Track which faceId belongs to which imageKey
-
-    for (const faceId of matchingFaceIds) {
-      const queryParams = {
-        TableName,
-        KeyConditionExpression: "FaceId = :faceId",
-        ExpressionAttributeValues: { ":faceId": faceId },
-      };
-      const queryResult = await docClient.send(new QueryCommand(queryParams));
-      if (queryResult.Items?.length > 0) {
-        const imageKey = queryResult.Items[0].ImageKey;
-        imageKeys.push(imageKey);
-        faceIdToImageKeyMap.set(faceId, imageKey); // Map faceId to its imageKey
-      }
-    }
-
-    const uniqueImageKeys = [...new Set(imageKeys)];
+    // Get unique images
+    const uniqueImageKeys = [...new Set(matches.map(m => m.imageKey))];
 
     const matchedImages = await Promise.all(
       uniqueImageKeys.map(async (imageKey) => {
-        const baseName = getBaseName(imageKey);
-        const pathParts = imageKey.split("/");
-        const userId = pathParts[1];
-        const basePath = `saylani-moments/${userId}/${eventId}`;
+        const faceImage = await db.collection('face_images').findOne({ mdKey: imageKey });
+        if (!faceImage) return null;
 
-        const [rawList, mdList, thumbList, facesList] = await Promise.all([
-          s3.send(
-            new ListObjectsV2Command({
-              Bucket,
-              Prefix: `${basePath}/rawuploads/`,
-            })
-          ),
-          s3.send(
-            new ListObjectsV2Command({
-              Bucket,
-              Prefix: `${basePath}/derivative/md/`,
-            })
-          ),
-          s3.send(
-            new ListObjectsV2Command({
-              Bucket,
-              Prefix: `${basePath}/derivative/thumb/`,
-            })
-          ),
-          // Get cropped faces for this specific image only
-          s3.send(
-            new ListObjectsV2Command({
-              Bucket,
-              Prefix: `${basePath}/faces/`,
-            })
-          ),
-        ]);
+        const match = matches.find(m => m.imageKey === imageKey);
+        const baseName = imageKey.split('/').pop().split('.')[0];
 
-        const rawExt =
-          rawList.Contents?.find((i) => i.Key.includes(baseName))
-            ?.Key?.split(".")
-            .pop() || "jpeg";
-        const mdExt =
-          mdList.Contents?.find((i) => i.Key.includes(baseName))
-            ?.Key?.split(".")
-            .pop() || "jpeg";
-        const thumbExt =
-          thumbList.Contents?.find((i) => i.Key.includes(baseName))
-            ?.Key?.split(".")
-            .pop() || "webp";
-
-        // Find the specific faceId that matches this imageKey
-        const matchingFaceId = Array.from(faceIdToImageKeyMap.entries()).find(
-          ([faceId, imgKey]) => imgKey === imageKey
-        )?.[0];
-
-        // Find cropped face for this SPECIFIC faceId (not just baseName)
-        const croppedFace = facesList.Contents?.find(
-          (face) =>
-            face.Key.includes(baseName) &&
-            matchingFaceId &&
-            face.Key.includes(matchingFaceId)
-        );
-
-        const imageUrls = generateImageUrls({
-          Bucket,
-          basePath,
-          baseName,
-          exts: { raw: rawExt, md: mdExt, thumb: thumbExt },
-        });
-
-        // Add cropped face URL only if it belongs to this specific face match
-        if (croppedFace) {
-          const baseUrl = `https://${Bucket}.s3.amazonaws.com`;
-          imageUrls.croppedFaceUrl = `${baseUrl}/${croppedFace.Key}`;
-          imageUrls.matchedFaceId = matchingFaceId; // For debugging
-        }
-
-        return imageUrls;
+        return {
+          id: baseName,
+          thumbUrl: generatePublicUrl(faceImage.thumbKey),
+          mdUrl: generatePublicUrl(faceImage.mdKey),
+          rawUrl: generatePublicUrl(faceImage.originalKey),
+          matchedFaceId: match.faceId,
+          similarity: match.similarity,
+        };
       })
     );
 
-    res.status(200).json({
-      message: `Found ${matchedImages.length} images with matching faces`,
-      total: matchedImages.length,
-      confidence: searchResponse.FaceMatches[0]?.Similarity || 0,
-      // images: matchedImages,
-      images: matchedImages.map((image) => ({
-        ...image,
-        matchedFaceId: image.matchedFaceId,
-      })),
-    });
+    const validImages = matchedImages.filter(img => img !== null);
+
+    const response = {
+      message: `Found ${validImages.length} images with matching faces`,
+      total: validImages.length,
+      confidence: matches[0]?.similarity || 0,
+      images: validImages,
+    };
+
+    // Cache the results for 30 minutes
+    await cache.cacheFaceMatch(eventId, uploadedFile.buffer, response);
+
+    res.status(200).json(response);
   } catch (err) {
     console.error("Face Matching Error:", err);
     res.status(500).json({ error: "Failed to match faces" });

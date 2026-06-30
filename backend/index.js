@@ -1,22 +1,35 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
+import compression from "compression";
 import connectDB from "./config/db.js";
+import { initializeQdrant } from "./lib/qdrantService.js";
+import { setupIndexes } from "./lib/mongoService.js";
 import eventRoutes from "./routes/eventRoutes.js";
 import imageRoutes from "./routes/imageRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
-import presignedRoutes from "./routes/s3PresignedRoutes.js";
+import presignedRoutes from "./routes/uploadRoutes.js";
 import faceMatchRoutes from "./routes/faceMatchRoutes.js";
 import userDashboardRoutes from "./routes/userDashboardRoutes.js";
 import saveMatchedRoutes from "./routes/saveMatchedRoutes.js";
 import morgan from "morgan";
 
 dotenv.config();
-connectDB();
+
+// Initialize database and services
+await connectDB();
+await initializeQdrant();
+await setupIndexes();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Enable gzip compression for API responses
+app.use(compression({
+  level: 6,  // Balance between speed and compression
+  threshold: 1024,  // Only compress responses > 1KB
+}));
 
 app.use(cors());
 app.use(morgan("dev"));

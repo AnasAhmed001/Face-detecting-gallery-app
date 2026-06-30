@@ -7,7 +7,6 @@ export const addPhotographer = async (req, res) => {
     const exists = await User.findOne({ email });
     if (exists)
       return res.status(400).json({ message: "Email already exists" });
-    // const hashedPassword = await bcrypt.hash(password, 10);
 
     const photographer = await User.create({
       name,
@@ -75,7 +74,6 @@ export const editPhotographer = async (req, res) => {
     if (phone) user.phone = phone;
     if (password) user.password = password;
 
-    // if (password) user.password = await bcrypt.hash(password, 10);
 
     const updatedPhotographer = await user.save();
     res.status(200).json({
