@@ -9,6 +9,7 @@ const connectDB = async () => {
       minPoolSize: 2,         // Keep 2 warm
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
+      family: 4,              // Force IPv4 resolution
     });
     console.log("MongoDB Connected with connection pooling");
   } catch (err) {

@@ -70,6 +70,11 @@ export async function generatePresignedPost(prefix, expirySeconds = 900) {
   return await r2Client.presignedPostPolicy(policy);
 }
 
+// Generate presigned PUT URL (for direct uploads)
+export async function generatePresignedPutUrl(key, expirySeconds = 900) {
+  return await r2Client.presignedPutObject(Bucket, key, expirySeconds);
+}
+
 // Generate presigned GET URL (for downloads)
 export async function generatePresignedUrl(key, expirySeconds = 3600) {
   return await r2Client.presignedGetObject(Bucket, key, expirySeconds);

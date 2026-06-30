@@ -31,9 +31,32 @@ export async function enqueueFaceDetection({ userId, eventId, imageKey }) {
 }
 
 /**
+ * Trigger face detection job asynchronously (fire-and-forget)
+ */
+export function enqueueFaceDetectionAsync({ userId, eventId, imageKey }) {
+  console.log(`[Queue] Triggering async face detection for: ${imageKey}`);
+  axios.post(MODAL_DETECT_FACES_URL, {
+    userId,
+    eventId,
+    imageKey,
+    bucket: process.env.R2_BUCKET,
+  }, {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Webhook-Secret': MODAL_WEBHOOK_SECRET,
+    },
+    timeout: 300000, // 5 minute timeout
+  }).then((response) => {
+    console.log(`[Queue] Async face detection completed for: ${imageKey}`);
+  }).catch((error) => {
+    console.error(`[Queue] Async face detection failed for ${imageKey}:`, error.message);
+  });
+}
+
+/**
  * Trigger face matching job on Modal Labs
  */
-export async function enqueueFaceMatching({ eventId, selfieBuffer, threshold = 0.75 }) {
+export async function enqueueFaceMatching({ eventId, selfieBuffer, threshold = 0.45 }) {
   try {
     // Convert buffer to base64 for transmission
     const selfieBase64 = selfieBuffer.toString('base64');
@@ -47,7 +70,7 @@ export async function enqueueFaceMatching({ eventId, selfieBuffer, threshold = 0
         'Content-Type': 'application/json',
         'X-Webhook-Secret': MODAL_WEBHOOK_SECRET,
       },
-      timeout: 60000, // 1 minute timeout for matching
+      timeout: 300000, // 5 minute timeout for matching to handle cold starts
     });
 
     return response.data;

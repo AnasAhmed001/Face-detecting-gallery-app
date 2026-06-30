@@ -25,7 +25,7 @@ export const faceMatchImages = async (req, res) => {
     const result = await enqueueFaceMatching({
       eventId,
       selfieBuffer: uploadedFile.buffer,
-      threshold: 0.75,
+      threshold: 0.45,
     });
 
     if (!result || !result.matches || result.matches.length === 0) {

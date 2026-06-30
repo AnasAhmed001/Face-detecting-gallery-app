@@ -50,7 +50,7 @@ import {
 import { cn } from "@/lib/utils";
 
 // Constants
-const MAX_UPLOAD_LIMIT = 500;
+const MAX_UPLOAD_LIMIT = 50;
 const COMPRESSION_THRESHOLD_MB = 2;
 
 // Filename sanitization function
@@ -159,6 +159,11 @@ export default function EventsDetails() {
   const [totalImages, setTotalImages] = useState(0);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
 
+  // Background processing states & refs
+  const [pendingCount, setPendingCount] = useState(0);
+  const initialTotalImagesRef = useRef(0);
+  const expectedPendingCountRef = useRef(0);
+
   const fileInputRef = useRef(null);
   const shareableLink = `${window.location.origin}/guest/event/${eventId}`;
   const shareableAlbumLink = `${
@@ -211,6 +216,78 @@ export default function EventsDetails() {
       }
     }
   }, [userId, eventId, currentPage, isInitialLoad]);
+
+  // Polling for background face processing results
+  useEffect(() => {
+    if (pendingCount <= 0) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const { data } = await api.get(`images/${userId}/${eventId}`, {
+          params: { page: 1 },
+        });
+
+        const currentTotal = data.total || 0;
+        const processedDelta = currentTotal - initialTotalImagesRef.current;
+        const remaining = Math.max(0, expectedPendingCountRef.current - processedDelta);
+
+        setPendingCount(remaining);
+
+        // Update list and keep remaining pending ones at the top of the gallery
+        setUploadedImages((prev) => {
+          const currentPending = prev.filter((img) => img.processing);
+          
+          // Find pending items that are now finished/processed (exist in fetched data)
+          const finishedPending = currentPending.filter((pending) =>
+            data.images.some(
+              (fetched) => fetched.id === pending.id.replace("pending-", "")
+            )
+          );
+
+          // Revoke their temporary Object URLs after a delay to allow the browser to transition the image source
+          finishedPending.forEach((pending) => {
+            if (pending.thumbUrl && pending.thumbUrl.startsWith("blob:")) {
+              setTimeout(() => {
+                URL.revokeObjectURL(pending.thumbUrl);
+              }, 1000);
+            }
+          });
+
+          const remainingPending = currentPending.filter(
+            (pending) =>
+              !data.images.some(
+                (fetched) => fetched.id === pending.id.replace("pending-", "")
+              )
+          );
+          return [...remainingPending, ...(data.images || [])];
+        });
+
+        setTotalImages(currentTotal);
+        setTotalPages(data.totalPages || 1);
+      } catch (err) {
+        console.error("Polling error:", err);
+      }
+    }, 5000);
+
+    // Timeout safety net (3 minutes)
+    const timeout = setTimeout(() => {
+      setPendingCount(0);
+      setUploadedImages((prev) => {
+        const remainingPending = prev.filter((img) => img.processing);
+        remainingPending.forEach((pending) => {
+          if (pending.thumbUrl && pending.thumbUrl.startsWith("blob:")) {
+            URL.revokeObjectURL(pending.thumbUrl);
+          }
+        });
+        return prev.filter((img) => !img.processing);
+      });
+    }, 180000);
+
+    return () => {
+      clearInterval(interval);
+      clearTimeout(timeout);
+    };
+  }, [pendingCount, userId, eventId]);
 
   const handlePageChange = (page) => {
     if (page >= 1 && page <= totalPages && page !== currentPage) {
@@ -318,39 +395,27 @@ export default function EventsDetails() {
     }
   }
 
-  function uploadFileWithFields(url, fields, file, sanitizedName, onProgress) {
+  function uploadFilePut(url, file, onProgress) {
     return new Promise((resolve, reject) => {
-      const formData = new FormData();
-      let keyFieldValue = fields.key || fields.Key || "";
-      if (
-        typeof keyFieldValue === "string" &&
-        keyFieldValue.includes("${filename}")
-      ) {
-        keyFieldValue = keyFieldValue.replace("${filename}", sanitizedName);
-      }
-      Object.entries(fields || {}).forEach(([k, v]) => {
-        formData.append(k === "key" || k === "Key" ? "key" : k, v);
-      });
-      if (!formData.has("key")) formData.set("key", keyFieldValue);
-      formData.append("file", file);
       const xhr = new XMLHttpRequest();
-      xhr.open("POST", url, true);
+      xhr.open("PUT", url, true);
+      if (file.type) {
+        xhr.setRequestHeader("Content-Type", file.type);
+      }
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && typeof onProgress === "function") {
           onProgress(Math.round((e.loaded / e.total) * 100));
         }
       };
       xhr.onload = () => {
-        if (xhr.status === 204 || (xhr.status >= 200 && xhr.status < 300)) {
-          resolve(
-            `${url.replace(/\/$/, "")}/${keyFieldValue || sanitizedName}`
-          );
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(url.split("?")[0]);
         } else {
           reject(new Error(`Upload failed with status ${xhr.status}`));
         }
       };
       xhr.onerror = () => reject(new Error("XHR upload error"));
-      xhr.send(formData);
+      xhr.send(file);
     });
   }
 
@@ -478,24 +543,22 @@ export default function EventsDetails() {
       );
       const postsMap = Array.isArray(postsResp)
         ? Object.fromEntries(
-            postsResp.map((p) => [p.fileName, { url: p.url, fields: p.fields }])
+            postsResp.map((p) => [p.fileName, p.url])
           )
         : Object.fromEntries(
             filesMeta.map((m) => [
               m.fileName,
-              { url: postsResp.url, fields: postsResp.fields },
+              postsResp.url,
             ])
           );
       const uploadPromises = filesToUpload.map((s) =>
         (async () => {
-          const match = postsMap[s.sanitizedName];
-          if (!match)
-            throw new Error(`No presigned post for ${s.sanitizedName}`);
-          const finalUrl = await uploadFileWithFields(
-            match.url,
-            match.fields,
+          const uploadUrl = postsMap[s.sanitizedName];
+          if (!uploadUrl)
+            throw new Error(`No presigned URL for ${s.sanitizedName}`);
+          await uploadFilePut(
+            uploadUrl,
             s.file,
-            s.sanitizedName,
             (percent) => {
               setSelectedFiles((prev) => {
                 const copy = [...prev];
@@ -506,38 +569,44 @@ export default function EventsDetails() {
               });
             }
           );
-
-          // Trigger face extraction on the backend after the raw image is uploaded to R2
-          const imageKey = `saylani-moments/${userId}/${eventId}/rawuploads/${s.sanitizedName}`;
-          const processResp = await api.post("s3/process-image", {
-            userId,
-            eventId,
-            imageKey,
-          });
-
-          if (processResp.data && processResp.data.success && processResp.data.image) {
-            return processResp.data.image;
-          }
-
-          return {
-            id: s.sanitizedName.split(".")[0],
-            name: s.sanitizedName,
-            rawUrl: finalUrl,
-            thumbUrl: finalUrl,
-            mdUrl: finalUrl,
-          };
+          return `saylani-moments/${userId}/${eventId}/rawuploads/${s.sanitizedName}`;
         })()
       );
-      const uploaded = await Promise.all(uploadPromises);
-      filesToUpload.forEach((sf) => sf.url && URL.revokeObjectURL(sf.url));
-      // Add uploaded images to the beginning of the current list
-      setUploadedImages((prev) => [...uploaded, ...prev]);
-      // Update total count
-      setTotalImages((prev) => prev + uploaded.length);
+
+      const uploadedKeys = await Promise.all(uploadPromises);
+
+      // Trigger batch face extraction on the backend once
+      await api.post("s3/process-images", {
+        userId,
+        eventId,
+        imageKeys: uploadedKeys,
+      });
+
+      // Set up background polling
+      initialTotalImagesRef.current = totalImages;
+      expectedPendingCountRef.current = filesToUpload.length;
+      setPendingCount(filesToUpload.length);
+
+      // Add temporary pending images with local previews
+      const pendingImages = filesToUpload.map((s) => {
+        const baseName = s.sanitizedName.split(".")[0];
+        return {
+          id: `pending-${baseName}`,
+          name: s.sanitizedName,
+          rawUrl: s.url,
+          thumbUrl: s.url,
+          mdUrl: s.url,
+          processing: true,
+        };
+      });
+
+      setUploadedImages((prev) => [...pendingImages, ...prev]);
       setSelectedFiles([]);
       setUploadProgress(100);
     } catch (err) {
       console.error("Upload error:", err);
+      // Revoke temp blob URLs if upload failed
+      filesToUpload.forEach((sf) => sf.url && URL.revokeObjectURL(sf.url));
     } finally {
       setLoading(false);
       setTimeout(() => setUploadProgress(0), 400);
@@ -957,53 +1026,69 @@ export default function EventsDetails() {
                         <div key={img.id || i} className="group relative">
                           <div className="overflow-hidden shadow-md hover:shadow-lg transition-shadow">
                             <div className="aspect-square relative">
-                              <Dialog>
-                                <DialogTrigger asChild>
-                                  <div className="cursor-pointer w-full h-full">
-                                    <img
-                                      src={
-                                        thumbSrc ||
-                                        "/placeholder.svg?height=200&width=200"
-                                      }
-                                      alt={img.name || `photo-${i}`}
-                                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                                    />
-                                  </div>
-                                </DialogTrigger>
-                                <DialogContent className="max-w-4xl bg-transparent border-0 p-0 shadow-none">
+                              {img.processing ? (
+                                <div className="w-full h-full relative">
                                   <img
-                                    src={
-                                      fullSrc ||
-                                      "/placeholder.svg?height=800&width=1200"
-                                    }
+                                    src={thumbSrc || "/placeholder.svg?height=200&width=200"}
                                     alt={img.name || `photo-${i}`}
-                                    className="w-full h-auto max-h-[90vh] object-contain rounded-lg"
+                                    className="w-full h-full object-cover filter blur-[2px]"
                                   />
-                                </DialogContent>
-                              </Dialog>
-                              <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors duration-200 pointer-events-none" />
-                              <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      variant="destructive"
-                                      size="icon"
-                                      className={`w-8 h-8 rounded-full ${
-                                        isDeleting ? "opacity-70" : ""
-                                      }`}
-                                      onClick={() => deleteImage(img)}
-                                      disabled={isDeleting}
-                                    >
-                                      {isDeleting ? (
-                                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                                      ) : (
-                                        <Trash2 className="w-4 h-4" />
-                                      )}
-                                    </Button>
-                                  </TooltipTrigger>
-                                  <TooltipContent>Remove photo</TooltipContent>
-                                </Tooltip>
-                              </div>
+                                  <div className="absolute inset-0 bg-black/50 flex flex-col items-center justify-center text-white text-xs gap-1.5 backdrop-blur-[1px]">
+                                    <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                                    <span className="font-semibold text-primary">Processing...</span>
+                                  </div>
+                                </div>
+                              ) : (
+                                <>
+                                  <Dialog>
+                                    <DialogTrigger asChild>
+                                      <div className="cursor-pointer w-full h-full">
+                                        <img
+                                          src={
+                                            thumbSrc ||
+                                            "/placeholder.svg?height=200&width=200"
+                                          }
+                                          alt={img.name || `photo-${i}`}
+                                          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                                        />
+                                      </div>
+                                    </DialogTrigger>
+                                    <DialogContent className="max-w-4xl bg-transparent border-0 p-0 shadow-none">
+                                      <img
+                                        src={
+                                          fullSrc ||
+                                          "/placeholder.svg?height=800&width=1200"
+                                        }
+                                        alt={img.name || `photo-${i}`}
+                                        className="w-full h-auto max-h-[90vh] object-contain rounded-lg"
+                                      />
+                                    </DialogContent>
+                                  </Dialog>
+                                  <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors duration-200 pointer-events-none" />
+                                  <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <Button
+                                          variant="destructive"
+                                          size="icon"
+                                          className={`w-8 h-8 rounded-full ${
+                                            isDeleting ? "opacity-70" : ""
+                                          }`}
+                                          onClick={() => deleteImage(img)}
+                                          disabled={isDeleting}
+                                        >
+                                          {isDeleting ? (
+                                            <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                                          ) : (
+                                            <Trash2 className="w-4 h-4" />
+                                          )}
+                                        </Button>
+                                      </TooltipTrigger>
+                                      <TooltipContent>Remove photo</TooltipContent>
+                                    </Tooltip>
+                                  </div>
+                                </>
+                              )}
                             </div>
                           </div>
                         </div>
